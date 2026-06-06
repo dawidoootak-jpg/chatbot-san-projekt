@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
 Load PDFs from data/raw/, chunk them, embed with Ollama, store in pgvector.
+Automatically falls back to OCR (Tesseract) for scanned/image-based PDFs.
 Run once before starting the app: uv run python scripts/ingest.py
 """
 import os
 import sys
 from pathlib import Path
 
+import pytesseract
+from pdf2image import convert_from_path
+from langchain.schema import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
@@ -16,6 +20,29 @@ DATA_DIR = Path(__file__).parent.parent / "data" / "raw"
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/san_chatbot")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+OCR_LANG = "pol+eng"
+MIN_TEXT_LENGTH = 100
+
+
+def load_pdf(path: Path) -> list[Document]:
+    """Load PDF, falling back to OCR if text extraction yields too little text."""
+    docs = PyPDFLoader(str(path)).load()
+    total_text = " ".join(d.page_content for d in docs).strip()
+
+    if len(total_text) >= MIN_TEXT_LENGTH:
+        return docs
+
+    print(f"  -> Scanned PDF detected, running OCR ({OCR_LANG})...")
+    images = convert_from_path(str(path), dpi=300)
+    ocr_docs = []
+    for i, image in enumerate(images):
+        text = pytesseract.image_to_string(image, lang=OCR_LANG)
+        if text.strip():
+            ocr_docs.append(Document(
+                page_content=text,
+                metadata={"source": str(path), "page": i},
+            ))
+    return ocr_docs
 
 
 def main():
@@ -26,9 +53,12 @@ def main():
 
     docs = []
     for path in pdf_files:
-        print(f"  Loading {path.name}...")
-        docs.extend(PyPDFLoader(str(path)).load())
-    print(f"Loaded {len(docs)} pages from {len(pdf_files)} PDFs")
+        print(f"Loading {path.name}...")
+        loaded = load_pdf(path)
+        print(f"  -> {len(loaded)} pages extracted")
+        docs.extend(loaded)
+
+    print(f"\nTotal: {len(docs)} pages from {len(pdf_files)} PDFs")
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = splitter.split_documents(docs)
